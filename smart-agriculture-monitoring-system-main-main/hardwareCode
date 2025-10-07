@@ -1,0 +1,221 @@
+// Upload this code in Arduino IDE for control thr Hardware Implementations
+
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <SPI.h>
+#include <SD.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <coap-simple.h> 
+#include <WiFiUdp.h>     
+
+// ----- DHT22 -----
+#define DHTPIN 4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// ----- Soil sensor & Relay -----
+const int soilPin = 34;   
+const int relayPin = 26;  
+
+// ----- SD Card -----
+const int chipSelect = 5; 
+
+// ----- Wi-Fi & MQTT -----
+const char* ssid = "realme 8 Pro";     
+const char* password = "123432165";   
+const char* mqttServer = "broker.hivemq.com";
+const int mqttPort = 1883;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ----- Soil Threshold -----
+int soilThreshold = 30; 
+
+// ----- Weather API -----
+String apiKey = "b9963e21b733749104c07cd1f52fbb63"; 
+String lat = "28.6692"; 
+String lon = "77.4538"; 
+bool skipIrrigation = false;
+
+// ----- CoAP client -----
+WiFiUDP udp;                
+int coapPort = 5683;        
+IPAddress coapServerIP(192,168,1,100); 
+Coap coapClient(udp); 
+
+// ----- MQTT Callback -----
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i=0; i<length; i++) msg += (char)payload[i];
+  Serial.println("[MQTT] Msg [" + String(topic) + "]: " + msg);
+
+  if(String(topic) == "agri/set_threshold"){
+    int newThreshold = msg.toInt();
+    if(newThreshold >=0 && newThreshold <=100){
+      soilThreshold = newThreshold;
+      Serial.println("✅ New Threshold set: " + String(soilThreshold) + "%");
+    }
+  }
+}
+
+// ----- Wi-Fi -----
+void setupWiFi(){
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid,password);
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi Connected: " + String(WiFi.localIP()));
+}
+
+// ----- SD Logging -----
+void logToSD(String payload) {
+  File f = SD.open("/datalog.csv", FILE_APPEND);
+  if (f) {
+    f.println(payload);
+    f.close();
+    Serial.println("💾 Logged to SD: " + payload);
+  } else {
+    Serial.println("❌ Failed to open SD file for writing");
+  }
+}
+
+void syncSDToMQTT() {
+  if (SD.exists("/datalog.csv")) {
+    File f = SD.open("/datalog.csv");
+    if (f) {
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        if (client.connected()) {
+          if (client.publish("agri/data", line.c_str(), false)) {
+            Serial.println("✅ Published to MQTT: " + line);
+          } else {
+            Serial.println("❌ Publish Failed for: " + line);
+          }
+        }
+      }
+      f.close();
+      SD.remove("/datalog.csv");
+      Serial.println("🗑 SD file cleared after sync");
+    }
+  }
+}
+
+// ----- MQTT Reconnect -----
+void reconnectMQTT(){
+  while(!client.connected()){
+    Serial.print("Connecting to MQTT...");
+    String clientId = "ESP32Client_" + String(random(0,9999));
+    if(client.connect(clientId.c_str())){
+      Serial.println("✅ Connected to MQTT!");
+      client.subscribe("agri/set_threshold");
+      syncSDToMQTT();
+    } else {
+      Serial.print("❌ Failed, rc="); Serial.print(client.state());
+      Serial.println(" Retrying in 2s...");
+      delay(2000);
+    }
+  }
+}
+
+// ----- Weather API -----
+bool rainSoon(){
+  if(WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/forecast?lat=" + lat + "&lon=" + lon + "&appid=" + apiKey;
+  http.begin(url);
+  int code = http.GET();
+  if(code==200){
+    String payload = http.getString();
+    StaticJsonDocument<10000> doc;  // ✅ Bigger buffer
+    DeserializationError err = deserializeJson(doc, payload);
+    if(!err){
+      for(int i=0;i<3;i++){ // next 9h
+        if(doc["list"][i]["rain"]) { http.end(); Serial.println("🌧 Rain predicted!"); return true; }
+        const char* weatherMain = doc["list"][i]["weather"][0]["main"];
+        if(String(weatherMain).indexOf("Rain")>=0){ http.end(); Serial.println("🌧 Rain forecasted!"); return true; }
+      }
+    } else {
+      Serial.println("⚠ JSON Parse Failed");
+    }
+  } else Serial.println("❌ Weather API failed: "+String(code));
+  http.end();
+  return false;
+}
+
+// ----- CoAP Helper -----
+void sendCoapData(String url, String payload) {
+  coapClient.put(coapServerIP, coapPort, url.c_str(), payload.c_str()); 
+  Serial.println("📡 CoAP Sent: " + payload);
+}
+
+// ----- Setup -----
+void setup(){
+  Serial.begin(115200);
+  pinMode(relayPin,OUTPUT); digitalWrite(relayPin,HIGH);
+  dht.begin();
+
+  if(!SD.begin(chipSelect)) Serial.println("❌ SD failed"); else Serial.println("✅ SD ready");
+
+  setupWiFi();
+  client.setServer(mqttServer,mqttPort);
+  client.setCallback(callback);
+
+  coapClient.start(); 
+}
+
+// ----- Main Loop -----
+unsigned long lastWeatherCheck = 0;
+const unsigned long weatherInterval = 3UL*60UL*60UL*1000UL; // 3h
+
+void loop(){
+  if(!client.connected()) reconnectMQTT();
+  client.loop();
+  coapClient.loop(); 
+
+  if(millis()-lastWeatherCheck > weatherInterval){
+    skipIrrigation = rainSoon();
+    lastWeatherCheck = millis();
+  }
+
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  int soilRaw = analogRead(soilPin);
+  if(isnan(temp)||isnan(hum)){ temp=0; hum=0; Serial.println("⚠ DHT error"); }
+
+  int soilPercent = map(soilRaw,0,4095,0,100);
+  soilPercent = constrain(soilPercent,0,100);
+
+  Serial.print("🌡 Temp: "); Serial.print(temp, 2); Serial.print("°C | ");
+  Serial.print("💧 Hum: "); Serial.print(hum, 2); Serial.print("% | ");
+  Serial.print("🌱 Soil: "); Serial.print(soilPercent); Serial.println("%");
+
+  String dataPayload = "{\"temp\":"+String(temp,1)+",\"hum\":"+String(hum,1)+",\"soil\":"+String(soilPercent)+"}";
+
+  if(client.connected()){ 
+    if(client.publish("agri/data",dataPayload.c_str(), false)) {
+      Serial.println("📤 Published to MQTT");
+    } else {
+      Serial.println("❌ Publish Failed, logging to SD");
+      logToSD(dataPayload);
+    }
+  } else {
+    logToSD(dataPayload);
+  }
+
+  if(soilPercent<soilThreshold && !skipIrrigation){
+    digitalWrite(relayPin,LOW); Serial.println("🚰 Pump ON");
+  } else {
+    digitalWrite(relayPin,HIGH);
+    if(skipIrrigation) Serial.println("🚱 Pump OFF due to rain"); 
+    else Serial.println("🚰 Pump OFF");
+  }
+
+  sendCoapData("moisture", dataPayload);
+
+  delay(1000); // ✅ 1s loop
+}
